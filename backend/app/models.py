@@ -9,7 +9,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
@@ -308,19 +308,44 @@ class StorageBatch:
     stored_at: str = ""
     status: str = "采集中"
     records: list[CleanedContent] = field(default_factory=list)
+    # 归档回执同步字段：存储清单和批次详情都直接读取这里，保证与凭证一致。
+    archive_policy_id: str = ""
+    archive_credential_id: str = ""
+    archive_scope: str = ""
+    archive_format: str = ""
+    archive_retention_days: int = 0
+    archive_expires_at: str = ""
+    archive_checksum: str = ""
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> StorageBatch:
+        def _int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _retention(value: Any) -> int:
+            digits = re.findall(r"\d+", str(value or ""))
+            return int(digits[0]) if digits else 0
+
         return cls(
             batch_id=str(row.get("批次编号", "")),
             source_job_id=str(row.get("来源作业", "")),
-            row_count=int(row.get("数据行数", 0)),
+            row_count=_int(row.get("数据行数", 0)),
             storage_path=str(row.get("存储路径", "")),
             compression=str(row.get("压缩格式", "gzip")),
             schema_version=str(row.get("Schema版本", "v1")),
             checksum=str(row.get("校验摘要", "")),
             stored_at=str(row.get("入库时间", "")),
             status=str(row.get("status", "采集中")),
+            archive_policy_id=str(row.get("归档策略", "")),
+            archive_credential_id=str(row.get("归档凭证", "")),
+            archive_scope=str(row.get("归档范围", "")),
+            archive_format=str(row.get("归档格式", "")),
+            archive_retention_days=_retention(row.get("保留时长", 0)),
+            archive_expires_at=str(row.get("到期时间", "")),
+            archive_checksum=str(row.get("归档摘要", "")),
         )
 
     def compute_checksum(self) -> str:
@@ -628,7 +653,12 @@ class CostRecord:
 
 @dataclass
 class ArchivePolicy:
-    """数据归档策略：data_archive 管理，定期归档批次存储数据。"""
+    """数据归档策略：data_archive 管理，定期归档批次存储数据。
+
+    策略可以按批次、按作业或全局配置；``data_scope`` 支持逗号分隔的多个范围，
+    也支持 ``batch:`` / ``job:`` / ``*`` 前缀。实际匹配规则由
+    ``app.services.data_archive`` 统一解释，避免各处各写一套。
+    """
     policy_id: str
     data_scope: str
     archive_cycle: str
@@ -638,29 +668,232 @@ class ArchivePolicy:
     compression_method: str = "gzip"
     last_archive: str = ""
     status: str = "待触发"
+    # 作业级策略：属于某个作业，但覆盖该作业下的全部批次。
+    job_scope: str = ""
+    updated_at: str = ""
+    source_row_id: int = 0
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> ArchivePolicy:
-        af_str = str(row.get("归档格式", ArchiveFormat.GZIP.value))
+        af = normalize_archive_format(row.get("归档格式", ArchiveFormat.GZIP.value))
         try:
-            af = ArchiveFormat(af_str)
-        except ValueError:
-            af = ArchiveFormat.GZIP
-        try:
-            rd = int(row.get("保留时长", 90))
+            rd = parse_retention(row.get("保留时长", 90), default=90)
         except (ValueError, TypeError):
             rd = 90
         return cls(
             policy_id=str(row.get("策略编号", "")),
             data_scope=str(row.get("数据范围", "")),
             archive_cycle=str(row.get("归档周期", "monthly")),
-            archive_format=af,
+            archive_format=ArchiveFormat(af),
             retention_days=rd,
             storage_location=str(row.get("存储位置", "")),
             compression_method=str(row.get("压缩方式", "gzip")),
             last_archive=str(row.get("最后归档", "")),
             status=str(row.get("status", "待触发")),
+            job_scope=str(row.get("作业范围") or row.get("job_scope") or ""),
+            updated_at=str(row.get("更新时间") or row.get("updated_at") or ""),
+            source_row_id=int(row.get("id", 0) or 0),
         )
+
+
+@dataclass
+class ArchiveScopeCredential:
+    """归档范围凭证：data_archive 签发，batch_store 的存储和清理按它取数。
+
+    凭证是归档确认时刻的快照：哪个策略被采用、实际归档范围、实际格式、
+    保留时长、确认时间和由此推算出的到期时间。历史回执（旧字段命名的
+    行）也能通过 ``from_row`` 归一化读取，因此新旧数据可以混用。
+    """
+
+    credential_id: str
+    batch_id: str
+    job_id: str = ""
+    policy_id: str = ""
+    policy_scope: str = ""
+    scope: str = ""
+    archive_format: str = "gzip"
+    retention_days: int = 90
+    archived_at: str = ""
+    expires_at: str = ""
+    checksum: str = ""
+    batch_checksum: str = ""
+    status: str = "已完成"
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+    is_default: bool = False
+
+    INACTIVE_STATUSES = ("已替代", "已失效", "作废", "superseded")
+
+    @property
+    def active(self) -> bool:
+        return self.status not in self.INACTIVE_STATUSES
+
+    @property
+    def valid(self) -> bool:
+        return self.active
+
+    @property
+    def data_scope(self) -> str:
+        """兼容旧策略字段名，实际范围始终以凭证的 scope 为准。"""
+        return self.scope
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "凭证编号": self.credential_id,
+            "批次编号": self.batch_id,
+            "作业编号": self.job_id,
+            "策略编号": self.policy_id,
+            "策略范围": self.policy_scope,
+            "归档范围": self.scope,
+            "归档格式": self.archive_format,
+            "保留时长": self.retention_days,
+            "确认时间": self.archived_at,
+            "到期时间": self.expires_at,
+            "校验摘要": self.checksum,
+            "批次摘要": self.batch_checksum,
+            "冲突策略": list(self.conflicts),
+            "默认策略": self.is_default,
+            "status": self.status,
+            "pending": False,
+            "abnormal": False,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> ArchiveScopeCredential:
+        """兼容新旧两种回执行结构，缺字段时用旧策略字段补齐。"""
+        scope = str(
+            row.get("归档范围") or row.get("scope") or row.get("数据范围") or ""
+        )
+        batch_id = str(
+            row.get("批次编号") or row.get("batch_id") or _batch_id_from_scope(scope) or ""
+        )
+        job_id = str(row.get("作业编号") or row.get("job_id") or "")
+        policy_id = str(row.get("策略编号") or row.get("policy_id") or "")
+        archive_format = normalize_archive_format(
+            row.get("归档格式") or row.get("archive_format") or ""
+        )
+        retention = parse_retention(
+            row.get("保留时长", row.get("retention_days")), default=90
+        )
+        archived_at = str(
+            row.get("确认时间") or row.get("归档时间") or row.get("起始时间")
+            or row.get("archived_at") or row.get("最后归档") or ""
+        )
+        expires_at = str(row.get("到期时间") or row.get("expires_at") or "")
+        if not expires_at and archived_at:
+            expires_at = compute_expiry(archived_at, retention)
+        checksum = str(row.get("校验摘要") or row.get("checksum") or "")
+        batch_checksum = str(
+            row.get("批次摘要") or row.get("batch_checksum") or row.get("归档摘要") or ""
+        )
+        credential_id = str(row.get("凭证编号") or row.get("credential_id") or "")
+        if not credential_id:
+            suffix = batch_id or policy_id or "LEGACY"
+            credential_id = f"ARCH-CRED-{suffix}"
+        status = str(
+            row.get("凭证状态") or row.get("status") or row.get("确认状态")
+            or "已完成"
+        )
+        raw_status = str(row.get("凭证状态") or "")
+        if not raw_status:
+            # 旧行没有"凭证状态"，沿用策略行状态时的映射：
+            # 只有明确的失效类状态才算无效，其余视为已确认。
+            status = "已完成" if status not in cls.INACTIVE_STATUSES else status
+        conflicts = row.get("冲突策略") or row.get("conflicts") or []
+        if not isinstance(conflicts, list):
+            conflicts = []
+        return cls(
+            credential_id=credential_id,
+            batch_id=batch_id,
+            job_id=job_id,
+            policy_id=policy_id,
+            policy_scope=str(row.get("策略范围") or row.get("policy_scope") or ""),
+            scope=scope or (f"batch:{batch_id}" if batch_id else ""),
+            archive_format=archive_format,
+            retention_days=retention,
+            archived_at=archived_at,
+            expires_at=expires_at,
+            checksum=checksum,
+            batch_checksum=batch_checksum,
+            status=status,
+            conflicts=conflicts,
+            is_default=bool(row.get("默认策略", row.get("is_default", False))),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.to_row()
+        payload.update({
+            "credential_id": self.credential_id,
+            "batch_id": self.batch_id,
+            "job_id": self.job_id,
+            "policy_id": self.policy_id,
+            "scope": self.scope,
+            "archive_format": self.archive_format,
+            "retention_days": self.retention_days,
+            "archived_at": self.archived_at,
+            "expires_at": self.expires_at,
+            "checksum": self.checksum,
+            "batch_checksum": self.batch_checksum,
+            "is_default": self.is_default,
+            "active": self.active,
+            "conflicts": list(self.conflicts),
+        })
+        return payload
+
+
+def normalize_archive_format(value: Any) -> str:
+    """把枚举、``ArchiveFormat.LZ4`` 或普通字符串统一成 ``lz4`` 形式。"""
+    if isinstance(value, ArchiveFormat):
+        return value.value
+    text = str(value or "").strip()
+    if not text:
+        return ArchiveFormat.GZIP.value
+    if text.startswith("ArchiveFormat."):
+        text = text.split(".", 1)[1]
+    lowered = text.casefold()
+    for item in ArchiveFormat:
+        if lowered in (item.value.casefold(), item.name.casefold()):
+            return item.value
+    return ArchiveFormat.GZIP.value
+
+
+def parse_retention(value: Any, default: int = 90) -> int:
+    """保留时长允许 ``90``、``90天``、``retention=30`` 等写法。"""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    digits = re.findall(r"\d+", str(value or ""))
+    if not digits:
+        return default
+    return max(0, int(digits[0]))
+
+
+def compute_expiry(archived_at: str, retention_days: int) -> str:
+    """按确认时间 + 保留天数计算实际到期时点；无法解析时返回空串。"""
+    if not archived_at:
+        return ""
+    try:
+        base = datetime.fromisoformat(str(archived_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
+    return (base + timedelta(days=max(0, int(retention_days)))).isoformat()
+
+
+def _batch_id_from_scope(scope: str) -> str:
+    tokens = re.split(r"[,，;；\s]+", str(scope or "").strip())
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        lowered = token.casefold()
+        for prefix in ("batch:", "batch=", "批次:", "批次="):
+            if lowered.startswith(prefix):
+                return token.split(":", 1)[-1].split("=", 1)[-1].strip()
+        if token not in ("*", "all", "全部", "所有"):
+            return token
+    return ""
 
 
 @dataclass

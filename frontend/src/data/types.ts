@@ -14,6 +14,7 @@ export type ModuleMeta = {
   entity: string
   desc: string
   fields: string[]
+  requiredFields?: string[]
   statuses: string[]
   actions: string[]
   actionTargets: Record<string, string>

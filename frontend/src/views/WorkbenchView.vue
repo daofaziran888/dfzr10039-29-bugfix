@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="meta.key === 'batch_store'"
+              class="link"
+              type="button"
+              :data-testid="`archive-detail-${row.id}`"
+              @click="openArchiveDetail(row)"
+            >
+              归档详情
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -73,7 +82,7 @@
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
-        <label v-for="field in meta.fields" :key="field" class="create-field">
+        <label v-for="field in createFields" :key="field" class="create-field">
           <span>{{ field }}</span>
           <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
         </label>
@@ -84,6 +93,26 @@
           </button>
         </div>
       </form>
+    </div>
+
+    <div v-if="archiveDetail" class="modal-backdrop" data-testid="archive-detail">
+      <section class="modal">
+        <h3>批次存储详情 · {{ archiveDetail['批次编号'] }}</h3>
+        <dl class="detail-grid">
+          <template v-for="item in archiveDetailRows" :key="item.label">
+            <dt>{{ item.label }}</dt>
+            <dd :data-testid="`archive-${item.label}`">{{ item.value ?? '—' }}</dd>
+          </template>
+        </dl>
+        <div class="page-actions">
+          <button class="btn" type="button" data-testid="archive-refresh" @click="refreshArchiveDetail">
+            重新取数
+          </button>
+          <button class="btn primary" type="button" data-testid="archive-close" @click="archiveDetail = null">
+            关闭
+          </button>
+        </div>
+      </section>
     </div>
 
     <footer class="page-foot">
@@ -99,6 +128,7 @@ import { computed, onMounted, ref } from 'vue'
 import {
   createEntry,
   downloadEntries,
+  getBatchArchiveDetail,
   listEntries,
   moduleMeta,
   runAction as applyAction,
@@ -115,6 +145,14 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const createFields = meta.requiredFields ?? meta.fields
+const archiveDetail = ref<Record<string, unknown> | null>(null)
+const archiveDetailId = ref<number | null>(null)
+const archiveDetailRows = computed(() => {
+  const detail = archiveDetail.value ?? {}
+  const labels = ['归档策略', '归档凭证', '归档范围', '归档格式', '保留时长', '到期时间', '归档摘要', '校验摘要']
+  return labels.map((label) => ({ label, value: detail[label] }))
+})
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -145,7 +183,7 @@ async function exportRows() {
 }
 
 function openCreate() {
-  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  createValues.value = Object.fromEntries(createFields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
 }
@@ -185,6 +223,26 @@ async function reload() {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }
+}
+
+async function fetchArchiveDetail(id: number) {
+  try {
+    archiveDetail.value = await getBatchArchiveDetail(id)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '归档详情读取失败'
+  }
+}
+
+async function openArchiveDetail(row: EntryRow) {
+  errorMessage.value = ''
+  archiveDetailId.value = Number(row.id)
+  await fetchArchiveDetail(Number(row.id))
+}
+
+async function refreshArchiveDetail() {
+  if (archiveDetailId.value === null) return
+  errorMessage.value = ''
+  await fetchArchiveDetail(archiveDetailId.value)
 }
 
 onMounted(reload)

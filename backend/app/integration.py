@@ -400,41 +400,23 @@ def _classify_change_type(new_count: int, changed_count: int, removed_count: int
 # ---------------------------------------------------------------------------
 
 def archive_batch(batch: StorageBatch) -> ArchivePolicy | None:
-    """从批次存储归档符合条件的批次数据。"""
-    # 优先查找与当前批次相关的策略
-    matched_policies: list[ArchivePolicy] = []
-    policies: list[ArchivePolicy] = []
-    for row in store.rows("data_archive"):
-        p = ArchivePolicy.from_seed_row(row)
-        if p.status in ("待触发", "已完成"):
-            policies.append(p)
-            if batch.batch_id in p.data_scope or p.data_scope == batch.batch_id:
-                matched_policies.append(p)
+    """按批次实际命中的策略归档，并签发可供存储使用的归档范围凭证。
 
-    # 优先使用匹配的策略
-    if matched_policies:
-        policy = matched_policies[0]
-        policy.last_archive = datetime.now(timezone.utc).isoformat()
-        policy.status = "已完成"
-        return policy
-
-    if not policies:
-        # 创建默认归档策略
-        policy = ArchivePolicy(
-            policy_id=f"ARCH-{batch.batch_id}",
-            data_scope=batch.batch_id,
-            archive_cycle="on_demand",
-            retention_days=90,
-            storage_location=f"/archive/{batch.batch_id}/",
-            last_archive=datetime.now(timezone.utc).isoformat(),
-            status="已完成",
-        )
-        _persist_archive_policy(policy)
-        return policy
-
-    policy = policies[0]
-    policy.last_archive = datetime.now(timezone.utc).isoformat()
-    policy.status = "已完成"
+    命中批次特定策略时用它；否则退到作业级策略；都没有就按批次自身范围
+    归档。绝不会把不相关的策略套到这个批次上，也不会在策略为空时报错。
+    """
+    service = _archive_service()
+    credential = service.confirm_archive(batch)
+    policy = ArchivePolicy(
+        policy_id=credential.policy_id,
+        data_scope=credential.policy_scope or credential.scope,
+        archive_cycle="on_demand" if credential.is_default else "matched",
+        archive_format=ArchiveFormat(credential.archive_format),
+        retention_days=credential.retention_days,
+        storage_location=f"/archive/{batch.batch_id}/",
+        last_archive=credential.archived_at,
+        status="已完成",
+    )
     return policy
 
 
@@ -641,6 +623,12 @@ def _persist_diff(diff: DiffRecord) -> None:
         "影响字段": ",".join(diff.affected_fields), "检测时间": diff.detected_at,
         "status": diff.status, "pending": False, "abnormal": False,
     })
+
+
+def _archive_service():
+    from app.services import service_for
+
+    return service_for("data_archive")
 
 
 def _persist_archive_policy(p: ArchivePolicy) -> None:

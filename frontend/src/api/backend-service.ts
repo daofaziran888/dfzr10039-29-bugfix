@@ -54,6 +54,23 @@ export async function downloadEntries(
   URL.revokeObjectURL(url)
 }
 
+export async function getBatchArchiveDetail(id: number): Promise<Record<string, unknown>> {
+  const response = await request(`/api/batch_store/${id}/archive`)
+  if (!response.ok) throw new Error('批次归档回执读取失败')
+  return await response.json()
+}
+
+export async function confirmArchive(
+  batchId: string,
+  options: { archive_format?: string; retention_days?: number; archived_at?: string } = {},
+): Promise<ActionResult & { entry?: Record<string, unknown> }> {
+  const response = await request('/api/data_archive/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ batch_id: batchId, ...options }),
+  })
+  return await response.json()
+}
+
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')

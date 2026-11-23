@@ -29,3 +29,14 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class ArchiveConfirmPayload(BaseModel):
+    """归档确认入参：只允许覆盖首次签发时的格式和保留期。"""
+
+    batch_id: str | None = None
+    policy_id: str | None = None
+    entry_id: int | None = None
+    archive_format: str | None = None
+    retention_days: int | None = None
+    archived_at: str | None = None
